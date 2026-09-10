@@ -30,6 +30,7 @@ import detailAtlasUrl from './generated/globe-detail-atlas.json?url'
 import interactionAtlasUrl from './generated/globe-interaction-atlas.json?url'
 import fallbackFeatures from './generated/country-geometry-fallbacks.json'
 import type { QuizCountry } from './quiz-data'
+import { createHemispherePath, prepareHemisphereGeometry, prepareHemisphereLabel } from './hemisphere-path'
 
 type AtlasFeature = GeoPermissibleObjects & {
   id?: string | number
@@ -620,6 +621,8 @@ function buildAtlasBundle(topology: Topology, countries: QuizCountry[]): AtlasBu
   const labelFeatureByCountryId = new Map<string, GeoPermissibleObjects>()
   const countryCentroidById = new Map<string, [number, number]>()
   const countryAngularRadiusById = new Map<string, number>()
+  prepareHemisphereGeometry(landFeature)
+  prepareHemisphereGeometry(borderMesh)
 
   for (const country of countries) {
     const matchedFeatureSource =
@@ -634,6 +637,8 @@ function buildAtlasBundle(topology: Topology, countries: QuizCountry[]): AtlasBu
 
     featureByCountryId.set(country.id, matchedFeature)
     const labelFeature = primaryLabelFeature(matchedFeature)
+    prepareHemisphereGeometry(matchedFeature)
+    prepareHemisphereGeometry(labelFeature)
     labelFeatureByCountryId.set(country.id, labelFeature)
     const centroid = geoCentroid(labelFeature) as [number, number]
     countryCentroidById.set(country.id, centroid)
@@ -665,6 +670,10 @@ export async function createGlobe(
   ])
   const atlas = buildAtlasBundle(topology, countries)
   const interactionAtlas = buildAtlasBundle(interactionTopology, countries)
+  for (const country of countries) {
+    const labelFeature = atlas.labelFeatureByCountryId.get(country.id)
+    if (labelFeature) prepareHemisphereLabel(labelFeature, Math.max(country.name.length, country.capitalDisplayName.length) * 10 + 40)
+  }
   let detailAtlas: AtlasBundle | null = null
   void fetch(detailAtlasUrl)
     .then((response) => response.json() as Promise<Topology>)
@@ -695,6 +704,7 @@ export async function createGlobe(
 
     fallbackFeatureByCountryId.set(country.id, normalizedFeature)
     const labelFeature = primaryLabelFeature(normalizedFeature)
+    prepareHemisphereLabel(labelFeature, Math.max(country.name.length, country.capitalDisplayName.length) * 10 + 40)
     fallbackLabelFeatureByCountryId.set(country.id, labelFeature)
     const centroid = geoCentroid(labelFeature) as [number, number]
     fallbackCentroidByCountryId.set(country.id, centroid)
@@ -734,10 +744,13 @@ export async function createGlobe(
   let currentProjectionKey = options?.initialProjection ?? DEFAULT_GLOBE_PROJECTION
   let projection = createProjection(currentProjectionKey)
   let measurementPath = geoPath(projection)
+  let hemispherePath: ReturnType<typeof createHemispherePath> | null = null
   // Projection-dependent positions live for one render only. Labels and the
   // plane use the same polygon centroid, including its horizon clipping.
   const projectedLabelPositions = new Map<string, [number, number] | null>()
   const paintedLabels = new WeakMap<SVGGElement, GlobeLabel>()
+  const paintedCountryFills = new WeakMap<SVGPathElement, string>()
+  const preloadedFlags = new Map<string, HTMLImageElement>()
   const graticule = geoGraticule10()
   const desktopFlightTrailsMediaQuery = window.matchMedia(DESKTOP_FLIGHT_TRAILS_MEDIA_QUERY)
 
@@ -1003,7 +1016,8 @@ export async function createGlobe(
     scheduleRender()
   }
 
-  function projectedPathData(geometry: GeoPermissibleObjects): string {
+  function projectedPathData(geometry: GeoPermissibleObjects, useHemisphereBounds = true): string {
+    if (hemispherePath && useHemisphereBounds) return hemispherePath.path(geometry)
     return measurementPath(geometry) ?? ''
   }
 
@@ -1381,7 +1395,8 @@ export async function createGlobe(
       .data(renderedSegments, (segment) => segment.id)
       .join('path')
       .attr('class', 'globe__flight-trail')
-      .attr('d', (segment) => projectedPathData(flightPathGeometry(segment)))
+      // Flight arcs change each frame and do not benefit from cached geometry bounds.
+      .attr('d', (segment) => projectedPathData(flightPathGeometry(segment), false))
       .attr('fill', 'none')
       .attr('stroke', (segment) =>
         segment.id === activeFlightSegmentId
@@ -1400,7 +1415,7 @@ export async function createGlobe(
       .data(activeSegment ? [activeSegment] : [], (segment) => segment.id)
       .join('path')
       .attr('class', 'globe__flight-progress')
-      .attr('d', (segment) => projectedPathData(flightPathGeometry(segment, activeFlightProgress)))
+      .attr('d', (segment) => projectedPathData(flightPathGeometry(segment, activeFlightProgress), false))
       .attr('fill', 'none')
       .attr('stroke', 'rgba(255, 239, 187, 0.68)')
       .attr('stroke-width', 2)
@@ -1426,7 +1441,7 @@ export async function createGlobe(
       return null
     }
 
-    const projected = measurementPath.centroid(labelFeature)
+    const projected = (hemispherePath ?? measurementPath).centroid(labelFeature)
 
     if (!projected || Number.isNaN(projected[0]) || Number.isNaN(projected[1])) {
       return null
@@ -1513,9 +1528,7 @@ export async function createGlobe(
     const visibleLabels: GlobeLabel[] = labelIds
       .map((countryId) => {
         const country = countryById.get(countryId)
-        const projected = projectedLabelPosition(countryId)
-
-        if (!country || !projected) {
+        if (!country) {
           return null
         }
 
@@ -1538,15 +1551,34 @@ export async function createGlobe(
           answered || skipped || preAnswerLabelMode === 'capital'
             ? country.capitalDisplayName
             : null
+        const flagAssetUrl =
+          (answered || skipped || showPreAnswerFlags) && country.appearance.kind === 'flag'
+            ? country.appearance.assetUrl
+            : null
+
+        const labelFeature = labelFeatureForCountry(countryId)
+        // Allow 20px per character (text is at most 13px) plus flag shadows.
+        // The plane still computes its full anchor even when a label is culled.
+        const paddingX = Math.max(topLabel?.length ?? 0, bottomLabel?.length ?? 0, 1) * 10 + 40
+        if (labelFeature && hemispherePath?.outsideViewport(labelFeature, paddingX, 64)) {
+          // Preserve the original flag-loading lead time while its label is
+          // off-screen, so entering the viewport never delays the image request.
+          if (flagAssetUrl && !preloadedFlags.has(flagAssetUrl)) {
+            const centroid = centroidForCountry(countryId)
+            if (centroid && isVisible(centroid)) {
+              const image = new Image()
+              image.src = flagAssetUrl
+              preloadedFlags.set(flagAssetUrl, image)
+            }
+          }
+          return null
+        }
+        const projected = projectedLabelPosition(countryId)
+        if (!projected) return null
 
         return {
           detail: bottomLabel,
-          flagAssetUrl:
-            answered || skipped || showPreAnswerFlags
-              ? country.appearance.kind === 'flag'
-                ? country.appearance.assetUrl
-                : null
-              : null,
+          flagAssetUrl,
           id: country.id,
           markerText: showMarker ? '?' : null,
           name: topLabel,
@@ -1716,6 +1748,9 @@ export async function createGlobe(
 
   function renderNow(): void {
     applyProjectionLayout()
+    hemispherePath = currentProjectionKey === 'orthographic'
+      ? createHemispherePath(projection, { width: cssWidth, height: cssHeight })
+      : null
     projectedLabelPositions.clear()
     writeRenderState()
     const mostRecentAnsweredId = latestAnsweredId(answeredIds)
@@ -1728,13 +1763,13 @@ export async function createGlobe(
     const landPathData = projectedPathData(displayAtlas.landFeature)
 
     spherePath
-      .attr('d', projectedPathData(currentSurfaceGeometry()))
+      .attr('d', projectedPathData(currentSurfaceGeometry(), false))
       .attr('fill', SEA_FILL)
       .attr('stroke', 'rgba(180, 225, 255, 0.55)')
       .attr('stroke-width', 2.2)
 
     graticulePath
-      .attr('d', projectedPathData(graticule))
+      .attr('d', projectedPathData(graticule, false))
       .attr('fill', 'none')
       .attr('stroke', 'rgba(168, 212, 244, 0.2)')
       .attr('stroke-width', 0.7)
@@ -1836,11 +1871,18 @@ export async function createGlobe(
       )
       .join('path')
       .attr('d', (entry) => projectedPathData(entry.feature))
-      .attr('fill', (entry) => entry.appearanceFill)
-      .attr('stroke', SOLVED_COUNTRY_OUTLINE_COLOR)
-      .attr('stroke-width', SOLVED_COUNTRY_OUTLINE_WIDTH)
-      .attr('stroke-linejoin', 'round')
-      .attr('stroke-linecap', 'round')
+      .each(function (entry) {
+        const paintedFill = paintedCountryFills.get(this)
+        if (paintedFill === entry.appearanceFill) return
+        this.setAttribute('fill', entry.appearanceFill)
+        if (paintedFill === undefined) {
+          this.setAttribute('stroke', SOLVED_COUNTRY_OUTLINE_COLOR)
+          this.setAttribute('stroke-width', String(SOLVED_COUNTRY_OUTLINE_WIDTH))
+          this.setAttribute('stroke-linejoin', 'round')
+          this.setAttribute('stroke-linecap', 'round')
+        }
+        paintedCountryFills.set(this, entry.appearanceFill)
+      })
 
     renderFlights()
 

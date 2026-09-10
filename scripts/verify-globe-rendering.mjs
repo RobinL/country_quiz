@@ -9,7 +9,7 @@ import { serveBuild } from './lib/serve-build.mjs'
 // Run separately from the real-time FPS benchmark (this uses a fake clock).
 const [baselineDir, currentDir = 'dist'] = process.argv.slice(2)
 assert(baselineDir, 'Usage: node scripts/verify-globe-rendering.mjs <baseline-build> [current-build]')
-const output = 'output/playwright/visual'
+const output = process.env.VISUAL_OUTPUT ?? 'output/playwright/visual'
 await mkdir(output, { recursive: true })
 // Obtain the same pinned assets as the app in one request, instead of making
 // hundreds of CDN requests whose completion can vary between screenshots.
@@ -26,10 +26,13 @@ const browser = await chromium.launch()
 const scenarios = [
   { name: 'desktop', query: '', width: 1280, height: 1000 },
   { name: 'mobile', query: '?flags=1&capitals=1', width: 390, height: 844 },
+  { name: 'mobile-solved', query: '', width: 390, height: 844, solvedCount: 100 },
+  { name: 'overview', query: '', width: 1280, height: 1000, overview: true },
   { name: 'route', query: '?mode=route', width: 1280, height: 1000 },
   { name: 'mercator', query: '?projection=mercator', width: 1280, height: 1000 },
   { name: 'equal-earth', query: '?projection=equal-earth', width: 1280, height: 1000 },
 ]
+const selectedScenarios = (process.env.SCENARIOS ?? '').split(',').filter(Boolean)
 const snapshots = new Map()
 let checked = 0
 let screenshots = 0
@@ -39,7 +42,14 @@ try {
     const server = await serveBuild(directory)
     try {
       for (const scenario of scenarios) {
-        const context = await browser.newContext({ viewport: { width: scenario.width, height: scenario.height }, serviceWorkers: 'block' })
+        if (selectedScenarios.length && !selectedScenarios.includes(scenario.name)) continue
+        const context = await browser.newContext({
+          viewport: { width: scenario.width, height: scenario.height },
+          deviceScaleFactor: scenario.width < 841 ? 2 : 1,
+          isMobile: scenario.width < 841,
+          hasTouch: scenario.width < 841,
+          serviceWorkers: 'block',
+        })
         await context.route('https://cdn.jsdelivr.net/npm/country-flag-icons@1.5.19/3x2/*.svg', async route => {
           const filename = new URL(route.request().url()).pathname.split('/').at(-1)
           await route.fulfill({ contentType: 'image/svg+xml', body: await readFile(`${flagsDirectory}/package/3x2/${filename}`) })
@@ -53,9 +63,51 @@ try {
         await page.waitForTimeout(1000)
         await page.clock.pauseAt(new Date('2026-09-10T12:01:00Z'))
         await page.clock.fastForward(256)
+        if (scenario.solvedCount) {
+          const records = JSON.parse(await readFile(new URL('../src/generated/quiz-country-records.json', import.meta.url)))
+          const names = Array.from({ length: scenario.solvedCount }, (_, i) => records[Math.floor(i * records.length / scenario.solvedCount)].name)
+          await page.evaluate(answers => {
+            const input = document.querySelector('#guess-input')
+            for (const answer of answers) {
+              input.value = answer
+              input.dispatchEvent(new Event('input', { bubbles: true }))
+            }
+          }, names)
+          await page.clock.fastForward(2048)
+          await page.clock.fastForward(256)
+          assert((await page.locator('#score').textContent()).startsWith(`${scenario.solvedCount}/`))
+        }
+        if (scenario.overview) {
+          for (let i = 0; i < 20; i++) {
+            await page.getByRole('button', { name: 'Zoom out', exact: true }).click()
+            await page.clock.fastForward(32)
+          }
+          await page.clock.fastForward(256)
+          assert.equal(await page.locator('.globe-frame').getAttribute('data-zoom'), '0.780')
+        }
         const capture = async (state, screenshot = false) => {
           const key = `${scenario.name}-${state}`
-          const svg = await page.locator('.globe-frame').evaluate(el => el.innerHTML)
+          if (screenshot) {
+            // Clicking controls below the map can scroll the page. Settle that
+            // scroll before sampling; screenshot() otherwise scrolls during capture.
+            await page.locator('.globe-frame').scrollIntoViewIfNeeded()
+            await page.clock.fastForward(32)
+          }
+          const svg = await page.locator('.globe-frame').evaluate((el, visibleOnly) => {
+            const clone = el.cloneNode(true)
+            if (visibleOnly) {
+              // Ignore only labels whose entire DOM bounds plus their shadows
+              // are off-screen. Every map path and visible label remains exact.
+              const frame = el.getBoundingClientRect()
+              const clonedLabels = clone.querySelectorAll('.globe__label')
+              el.querySelectorAll('.globe__label').forEach((label, i) => {
+                const box = label.getBoundingClientRect()
+                if (box.right + 36 < frame.left || box.left - 36 > frame.right ||
+                  box.bottom + 36 < frame.top || box.top - 36 > frame.bottom) clonedLabels[i].remove()
+              })
+            }
+            return clone.innerHTML
+          }, Boolean(process.env.IGNORE_OFFSCREEN_LABELS))
           if (screenshot) {
             await page.waitForLoadState('networkidle')
           }
@@ -109,7 +161,12 @@ try {
         }
         await capture('initial', true)
         // Real answers exercise label content/tone changes and country fills.
-        if (scenario.name !== 'route') {
+        if (scenario.name === 'route') {
+          await page.getByRole('button', { name: 'Skip', exact: true }).click()
+          await page.clock.fastForward(2048)
+          await page.clock.fastForward(256)
+          await capture('skipped', true)
+        } else if (!scenario.solvedCount) {
           await page.getByRole('searchbox').fill('France')
           await page.clock.fastForward(2048)
           await page.getByRole('searchbox').fill('United States')
@@ -130,7 +187,7 @@ try {
           await capture(`${to}-settled`, true)
           from = to
         }
-        if (scenario.name === 'mobile') {
+        if (scenario.width < 841) {
           await page.locator('.globe__map-svg').dispatchEvent('wheel', { deltaY: -80, bubbles: true })
         } else {
           await page.getByRole('button', { name: 'Zoom in', exact: true }).click()
@@ -138,6 +195,39 @@ try {
         await page.clock.fastForward(512)
         await page.clock.fastForward(256)
         await capture('zoomed', true)
+        if (scenario.name === 'desktop') {
+          const frame = page.locator('.globe-frame')
+          const beforeDrag = await frame.getAttribute('data-rotation-lon')
+          const box = await page.locator('.globe__map-svg').boundingBox()
+          await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+          await page.mouse.down()
+          await page.mouse.move(box.x + box.width / 2 + 100, box.y + box.height / 2 + 40, { steps: 8 })
+          await page.mouse.up()
+          await page.clock.fastForward(512)
+          await page.clock.fastForward(256)
+          assert.notEqual(await frame.getAttribute('data-rotation-lon'), beforeDrag, 'Dragging must rotate the globe')
+          await capture('dragged', true)
+          await page.locator('#settings-button').click()
+          await page.locator('#setting-show-flags').check()
+          await page.locator('#setting-show-capitals').check()
+          await page.locator('#settings-close').click()
+          await page.clock.fastForward(256)
+          await capture('show-capitals', true)
+          await page.locator('#settings-button').click()
+          await page.locator('#setting-show-flags').uncheck()
+          await page.locator('#setting-show-capitals').uncheck()
+          await page.locator('#setting-projection').selectOption('mercator')
+          await page.locator('#settings-close').click()
+          await page.clock.fastForward(256)
+          assert.equal(await frame.getAttribute('data-projection'), 'mercator')
+          await capture('switched-mercator', true)
+          await page.locator('#settings-button').click()
+          await page.locator('#setting-projection').selectOption('orthographic')
+          await page.locator('#settings-close').click()
+          await page.clock.fastForward(256)
+          assert.equal(await frame.getAttribute('data-projection'), 'orthographic')
+          await capture('switched-globe', true)
+        }
         assert.deepEqual(errors, [], `${scenario.name}: browser errors`)
         await context.close()
         console.log(`${build}: ${scenario.name} verified`)

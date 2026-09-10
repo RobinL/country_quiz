@@ -1,5 +1,9 @@
 # Flight rendering performance
 
+This report records the first optimisation, commit `76317d0`. Its reproduction
+commands assume that checkout. See [the second-pass report](flight-performance-phase-two.md)
+for the current renderer, its additional improvements, and updated verification.
+
 Measured on 10 September 2026 against commit `1cdd54cb4fda0a0de9a205f0337f4388b7cde7c5`.
 The target was at least 30% higher flight FPS with unchanged visual fidelity.
 
