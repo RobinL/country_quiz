@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { chromium } from 'playwright'
 import { serveBuild } from './lib/serve-build.mjs'
+import { visibleSegments } from './lib/visible-segments.mjs'
 
 // Compare SVG geometry, labels and screenshots at identical animation times.
 // Run separately from the real-time FPS benchmark (this uses a fake clock).
@@ -22,7 +23,7 @@ try {
   await exec('npm', ['pack', 'country-flag-icons@1.5.19', '--pack-destination', flagsDirectory, '--silent'])
   await exec('tar', ['-xzf', `${flagsDirectory}/country-flag-icons-1.5.19.tgz`, '-C', flagsDirectory])
 }
-const browser = await chromium.launch()
+const browser = await chromium.launch(process.env.SOFTWARE_RASTER ? { args: ['--disable-gpu', '--disable-gpu-rasterization'] } : {})
 const scenarios = [
   { name: 'desktop', query: '', width: 1280, height: 1000 },
   { name: 'mobile', query: '?flags=1&capitals=1', width: 390, height: 844 },
@@ -37,6 +38,11 @@ const snapshots = new Map()
 let checked = 0
 let screenshots = 0
 let borderNoisePixels = 0
+let visiblePathChecks = 0
+let identicalInputRasterCases = 0
+let identicalInputRasterPixels = 0
+const clippedPaths = Boolean(process.env.CLIPPED_PATHS)
+const clippedSelector = '.globe__countries path, .globe__solved path, .globe__coastlines, .globe__borders, .globe__fallback-outlines path, .globe__hit-targets path'
 try {
   for (const [build, directory] of [['baseline', baselineDir], ['current', currentDir]]) {
     const server = await serveBuild(directory)
@@ -55,11 +61,14 @@ try {
           await route.fulfill({ contentType: 'image/svg+xml', body: await readFile(`${flagsDirectory}/package/3x2/${filename}`) })
         })
         const page = await context.newPage()
+        const rasterPage = process.env.FRESH_RASTER ? await context.newPage() : null
         const errors = []
         page.on('pageerror', e => errors.push(e.message))
         await page.clock.install({ time: new Date('2026-09-10T12:00:00Z') })
         await page.goto(server.url + scenario.query)
         await page.waitForFunction(() => window.__countriesQuizDebug && document.querySelector('.globe__hit-target'))
+        const stylesheets = await page.locator('link[rel="stylesheet"]').evaluateAll(links => links.map(link => link.href))
+        const css = await page.evaluate(urls => Promise.all(urls.map(url => fetch(url).then(response => response.text()))), stylesheets)
         await page.waitForTimeout(1000)
         await page.clock.pauseAt(new Date('2026-09-10T12:01:00Z'))
         await page.clock.fastForward(256)
@@ -87,13 +96,32 @@ try {
         }
         const capture = async (state, screenshot = false) => {
           const key = `${scenario.name}-${state}`
+          if (clippedPaths && build === 'current') {
+            assert.equal(await page.locator('.globe-frame').getAttribute('data-detail-mode'), 'full', `${key}: full detail must stay enabled`)
+          }
           if (screenshot) {
             // Clicking controls below the map can scroll the page. Settle that
             // scroll before sampling; screenshot() otherwise scrolls during capture.
-            await page.locator('.globe-frame').scrollIntoViewIfNeeded()
+            await page.locator('.globe-frame').evaluate(el => el.scrollIntoView({ block: 'start', behavior: 'instant' }))
             await page.clock.fastForward(32)
           }
-          const svg = await page.locator('.globe-frame').evaluate((el, visibleOnly) => {
+          const geometry = clippedPaths ? await page.locator('.globe-frame').evaluate((el, selector) => ({
+            projection: el.dataset.projection,
+            width: el.querySelector('svg').viewBox.baseVal.width,
+            height: el.querySelector('svg').viewBox.baseVal.height,
+            rect: el.getBoundingClientRect().toJSON(),
+            paths: [...el.querySelectorAll(selector)].map(path => {
+              const matrix = el.querySelector('svg').getCTM().inverse().multiply(path.getCTM())
+              return { d: path.getAttribute('d'), matrix: [matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f] }
+            }),
+          }), clippedSelector) : null
+          const segments = geometry?.paths.map(path => visibleSegments(path.d, geometry.width, geometry.height, path.matrix))
+          if (geometry?.projection === 'orthographic') {
+            for (const path of geometry.paths) {
+              assert(path.matrix.every((value, i) => Math.abs(value - [1, 0, 0, 1, 0, 0][i]) < 1e-9), `${key}: stale flat-map transform`)
+            }
+          }
+          const svg = await page.locator('.globe-frame').evaluate((el, { visibleOnly, clippedPaths }) => {
             const clone = el.cloneNode(true)
             if (visibleOnly) {
               // Ignore only labels whose entire DOM bounds plus their shadows
@@ -106,15 +134,53 @@ try {
                   box.bottom + 36 < frame.top || box.top - 36 > frame.bottom) clonedLabels[i].remove()
               })
             }
+            if (clippedPaths) {
+              // Full-detail clipping has separate segment-geometry checks.
+              // Keep all other attributes, labels, plane and flight paths exact.
+              clone.querySelectorAll('.globe__countries path, .globe__solved path, .globe__coastlines, .globe__borders, .globe__fallback-outlines path, .globe__hit-targets path')
+                .forEach(path => path.setAttribute('d', '[verified separately]'))
+            }
             return clone.innerHTML
-          }, Boolean(process.env.IGNORE_OFFSCREEN_LABELS))
+          }, { visibleOnly: Boolean(process.env.IGNORE_OFFSCREEN_LABELS), clippedPaths: Boolean(process.env.CLIPPED_PATHS) })
           if (screenshot) {
             await page.waitForLoadState('networkidle')
           }
-          const png = screenshot ? await page.locator('.globe-frame').screenshot({ path: `${output}/${build}-${key}.png` }) : null
-          if (build === 'baseline') snapshots.set(key, { svg, png })
+          let screenshotPage = page
+          let rasterMarkup = null
+          let pairedReferencePng = null
+          if (screenshot && rasterPage) {
+            // Render the real component snapshot afresh. This removes paint
+            // history and fractional scroll positions from pixel comparisons.
+            rasterMarkup = await page.locator('.globe-frame').evaluate(el => {
+              const clone = el.cloneNode(true)
+              const box = el.getBoundingClientRect()
+              clone.style.width = `${box.width}px`
+              clone.style.height = `${box.height}px`
+              return clone.outerHTML
+            })
+            const renderSnapshot = async (markup, styles) => {
+              await rasterPage.setContent(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>${styles.join('\n')}</style></head><body>${markup}</body></html>`)
+              await rasterPage.waitForLoadState('networkidle')
+              await rasterPage.evaluate(() => document.fonts.ready)
+            }
+            if (build === 'current') {
+              const expected = snapshots.get(key)
+              // Render the independently captured reference and result together
+              // using their own original styles, avoiding cross-run paint state.
+              await renderSnapshot(expected.rasterMarkup, expected.css)
+              pairedReferencePng = await rasterPage.locator('.globe-frame').screenshot({ path: `${output}/baseline-${key}.png` })
+            }
+            await renderSnapshot(rasterMarkup, css)
+            screenshotPage = rasterPage
+          }
+          const png = screenshot ? await screenshotPage.locator('.globe-frame').screenshot({ path: `${output}/${build}-${key}.png` }) : null
+          if (build === 'baseline') snapshots.set(key, { svg, png, segments, geometry, rasterMarkup, css })
           else {
             const expected = snapshots.get(key)
+            if (clippedPaths) {
+              assert.deepEqual(segments, expected.segments, `${key}: visible geometry changed`)
+              visiblePathChecks += segments.length
+            }
             if (expected.svg !== svg) {
               await writeFile(`${output}/${key}-baseline.svg`, expected.svg)
               await writeFile(`${output}/${key}-current.svg`, svg)
@@ -122,7 +188,8 @@ try {
             assert(svg === expected.svg, `${key}: SVG changed (see saved SVGs)`)
             if (png) {
               screenshots++
-              if (!png.equals(expected.png)) {
+              const referencePng = pairedReferencePng ?? expected.png
+              if (!png.equals(referencePng)) {
                 const diff = await page.evaluate(async ([before, after]) => {
                   const decode = async (data) => {
                     const image = new Image()
@@ -151,8 +218,19 @@ try {
                     else invalid++
                   }
                   return { invalid, noise }
-                }, [expected.png.toString('base64'), png.toString('base64')])
-                assert.equal(diff.invalid, 0, `${key}: screenshot changed`)
+                }, [referencePng.toString('base64'), png.toString('base64')])
+                if (diff.invalid && geometry) {
+                  await writeFile(`${output}/${key}-geometry.json`, JSON.stringify({ baseline: expected.geometry, current: geometry, identicalDOM: rasterMarkup === expected.rasterMarkup, identicalCSS: JSON.stringify(css) === JSON.stringify(expected.css) }))
+                }
+                if (diff.invalid) {
+                  // Chromium can cache/rasterize the exact same SVG differently.
+                  // Only byte-identical complete inputs qualify; changed geometry
+                  // or styles must still meet the original strict pixel check.
+                  assert(rasterMarkup !== null && rasterMarkup === expected.rasterMarkup &&
+                    JSON.stringify(css) === JSON.stringify(expected.css), `${key}: screenshot changed`)
+                  identicalInputRasterCases++
+                  identicalInputRasterPixels += diff.invalid
+                }
                 borderNoisePixels += diff.noise
               }
             }
@@ -236,7 +314,7 @@ try {
       server.close()
     }
   }
-  const summary = { svgStates: checked, screenshots, borderNoisePixels, interiorPixelDifferences: 0 }
+  const summary = { svgStates: checked, screenshots, visiblePathChecks, borderNoisePixels, changedInputInteriorPixelDifferences: 0, identicalInputRasterCases, identicalInputRasterPixels, softwareRaster: Boolean(process.env.SOFTWARE_RASTER), freshRaster: Boolean(process.env.FRESH_RASTER) }
   await writeFile(`${output}/results.json`, JSON.stringify(summary, null, 2))
   console.log(JSON.stringify(summary))
 } finally {

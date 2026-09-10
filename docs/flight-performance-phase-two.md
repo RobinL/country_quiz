@@ -1,5 +1,8 @@
 # Second flight-rendering optimisation
 
+This report records commit `c7502e9`. See [full-detail rendering](full-detail-rendering.md)
+for the subsequent removal of animation-time detail switching and its measurements.
+
 This pass measures improvement **over the first performance PR commit**,
 `76317d0f873eb8f0955790d2a60986e914054ccb`. The target is a further 50% increase
 in flight FPS, preserving visual fidelity.

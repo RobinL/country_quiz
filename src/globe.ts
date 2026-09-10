@@ -164,8 +164,6 @@ type FlightPerformanceAccumulator = {
   totalFrameMs: number
 }
 
-type MotionSource = 'drag' | 'flight' | 'pinch' | 'wheel'
-
 export type GlobeProjectionKey =
   | 'mercator'
   | 'equirectangular'
@@ -195,7 +193,6 @@ const WHEEL_ZOOM_SENSITIVITY = 0.0034
 const MAX_WHEEL_DELTA = 80
 const MIN_PINCH_DISTANCE_PX = 24
 const MOBILE_CHEAT_HOLD_MS = 2000
-const SETTLED_OUTLINE_DELAY_MS = 140
 const MAP_LABEL_CENTER_ROW_OFFSET_PX = -4
 const MAP_LABEL_NAME_ROW_GAP_PX = 22
 const MAP_LABEL_DETAIL_ROW_GAP_PX = 18
@@ -664,9 +661,10 @@ export async function createGlobe(
     onFlightPerformanceChange?: (performance: GlobeFlightPerformance | null) => void
   },
 ): Promise<GlobeController> {
-  const [topology, interactionTopology] = await Promise.all([
+  const [topology, interactionTopology, detailTopology] = await Promise.all([
     fetch(atlasUrl).then((response) => response.json()) as Promise<Topology>,
     fetch(interactionAtlasUrl).then((response) => response.json()) as Promise<Topology>,
+    fetch(detailAtlasUrl).then((response) => response.json()) as Promise<Topology>,
   ])
   const atlas = buildAtlasBundle(topology, countries)
   const interactionAtlas = buildAtlasBundle(interactionTopology, countries)
@@ -674,17 +672,7 @@ export async function createGlobe(
     const labelFeature = atlas.labelFeatureByCountryId.get(country.id)
     if (labelFeature) prepareHemisphereLabel(labelFeature, Math.max(country.name.length, country.capitalDisplayName.length) * 10 + 40)
   }
-  let detailAtlas: AtlasBundle | null = null
-  void fetch(detailAtlasUrl)
-    .then((response) => response.json() as Promise<Topology>)
-    .then((resolvedTopology) => {
-      detailAtlas = buildAtlasBundle(resolvedTopology, countries)
-
-      if (outlineDetailMode === 'settled') {
-        scheduleRender()
-      }
-    })
-    .catch(() => undefined)
+  const detailAtlas = buildAtlasBundle(detailTopology, countries)
   const fallbackFeatureByCountryId = new Map<string, AtlasFeature>()
   const fallbackLabelFeatureByCountryId = new Map<string, GeoPermissibleObjects>()
   const fallbackCentroidByCountryId = new Map<string, [number, number]>()
@@ -744,6 +732,13 @@ export async function createGlobe(
   let currentProjectionKey = options?.initialProjection ?? DEFAULT_GLOBE_PROJECTION
   let projection = createProjection(currentProjectionKey)
   let measurementPath = geoPath(projection)
+  let flatGeometryCache: {
+    key: GlobeProjectionKey
+    scale: number
+    path: ReturnType<typeof geoPath>
+    paths: WeakMap<object, string>
+  } | null = null
+  const paintedPaths = new WeakMap<SVGPathElement, string>()
   let hemispherePath: ReturnType<typeof createHemispherePath> | null = null
   // Projection-dependent positions live for one render only. Labels and the
   // plane use the same polygon centroid, including its horizon clipping.
@@ -783,10 +778,6 @@ export async function createGlobe(
   let debugFlightSequence = 0
   let flightPerformance: GlobeFlightPerformance | null = null
   let flightPerformanceAccumulator: FlightPerformanceAccumulator | null = null
-  let outlineDetailMode: 'interactive' | 'settled' = 'settled'
-  let outlineMotionSources = new Set<MotionSource>()
-  let outlineSettleTimeoutId: number | null = null
-  let wheelMotionTimeoutId: number | null = null
   let pendingFlightCompletion:
     | ((performance: GlobeFlightPerformance | null) => void)
     | null = null
@@ -938,70 +929,13 @@ export async function createGlobe(
 
   function writeRenderState(): void {
     const [rotationLongitude, rotationLatitude] = projection.rotate()
-    container.dataset.detailMode = outlineDetailMode
+    container.dataset.detailMode = 'full'
     container.dataset.projection = currentProjectionKey
     container.dataset.panX = mapPanOffset[0].toFixed(2)
     container.dataset.panY = mapPanOffset[1].toFixed(2)
     container.dataset.rotationLon = rotationLongitude.toFixed(2)
     container.dataset.rotationLat = rotationLatitude.toFixed(2)
     container.dataset.zoom = currentZoom.toFixed(3)
-  }
-
-  function clearOutlineSettleTimeout(): void {
-    if (outlineSettleTimeoutId === null) {
-      return
-    }
-
-    window.clearTimeout(outlineSettleTimeoutId)
-    outlineSettleTimeoutId = null
-  }
-
-  function setOutlineDetailMode(nextMode: 'interactive' | 'settled'): void {
-    if (outlineDetailMode === nextMode) {
-      return
-    }
-
-    outlineDetailMode = nextMode
-    scheduleRender()
-  }
-
-  function beginOutlineMotion(source: MotionSource): void {
-    clearOutlineSettleTimeout()
-    outlineMotionSources.add(source)
-    setOutlineDetailMode('interactive')
-  }
-
-  function endOutlineMotion(
-    source: MotionSource,
-    delayMs = SETTLED_OUTLINE_DELAY_MS,
-  ): void {
-    outlineMotionSources.delete(source)
-
-    if (outlineMotionSources.size > 0) {
-      return
-    }
-
-    clearOutlineSettleTimeout()
-    outlineSettleTimeoutId = window.setTimeout(() => {
-      outlineSettleTimeoutId = null
-
-      if (outlineMotionSources.size === 0) {
-        setOutlineDetailMode('settled')
-      }
-    }, delayMs)
-  }
-
-  function pulseWheelOutlineMotion(): void {
-    beginOutlineMotion('wheel')
-
-    if (wheelMotionTimeoutId !== null) {
-      window.clearTimeout(wheelMotionTimeoutId)
-    }
-
-    wheelMotionTimeoutId = window.setTimeout(() => {
-      wheelMotionTimeoutId = null
-      endOutlineMotion('wheel')
-    }, SETTLED_OUTLINE_DELAY_MS)
   }
 
   function syncCanvasSize(): void {
@@ -1017,8 +951,21 @@ export async function createGlobe(
   }
 
   function projectedPathData(geometry: GeoPermissibleObjects, useHemisphereBounds = true): string {
+    if (flatGeometryCache && useHemisphereBounds) {
+      const cached = flatGeometryCache.paths.get(geometry)
+      if (cached !== undefined) return cached
+      const data = flatGeometryCache.path(geometry) ?? ''
+      flatGeometryCache.paths.set(geometry, data)
+      return data
+    }
     if (hemispherePath && useHemisphereBounds) return hemispherePath.path(geometry)
     return measurementPath(geometry) ?? ''
+  }
+
+  function paintPath(node: SVGPathElement, data: string): void {
+    if (paintedPaths.get(node) === data) return
+    node.setAttribute('d', data)
+    paintedPaths.set(node, data)
   }
 
   function isVisible(coordinates: [number, number]): boolean {
@@ -1748,17 +1695,35 @@ export async function createGlobe(
 
   function renderNow(): void {
     applyProjectionLayout()
+    let flatTransform: string | null = null
+    if (usesGlobeInteraction()) {
+      flatGeometryCache = null
+      delete container.dataset.pathReferenceScale
+    } else {
+      // Flat-map motion only changes scale and translation. Project the full
+      // geometry once, at maximum zoom precision, and let SVG apply that affine
+      // transform. Every source vertex is retained; lower zooms gain precision.
+      const scale = Math.ceil(fittedBaseScale * MAX_ZOOM)
+      if (flatGeometryCache?.key !== currentProjectionKey || flatGeometryCache.scale !== scale) {
+        const referenceProjection = createProjection(currentProjectionKey, projectionRotation()).scale(scale).translate([0, 0])
+        flatGeometryCache = { key: currentProjectionKey, scale, path: geoPath(referenceProjection).digits(6), paths: new WeakMap() }
+        container.dataset.pathReferenceScale = String(scale)
+      }
+      const ratio = currentScale() / scale
+      const [x, y] = currentTranslate()
+      flatTransform = `matrix(${ratio} 0 0 ${ratio} ${x} ${y})`
+    }
+    for (const layer of [countriesLayer, solvedLayer, coastlinePath, borderPath, fallbackOutlineLayer, hitTargetLayer]) {
+      layer.attr('transform', flatTransform)
+    }
     hemispherePath = currentProjectionKey === 'orthographic'
-      ? createHemispherePath(projection, { width: cssWidth, height: cssHeight })
+      ? createHemispherePath(projection, { width: cssWidth, height: cssHeight, clipPaths: true, clipExtent: true })
       : null
     projectedLabelPositions.clear()
     writeRenderState()
     const mostRecentAnsweredId = latestAnsweredId(answeredIds)
     const isFlightAnimating = Boolean(activeFlightSegmentId && activeFlightProgress < 1)
-    const displayAtlas =
-      outlineDetailMode === 'settled' && detailAtlas
-        ? detailAtlas
-        : atlas
+    const displayAtlas = detailAtlas
     // The fill and coastline share exactly the same geometry and projection.
     const landPathData = projectedPathData(displayAtlas.landFeature)
 
@@ -1778,7 +1743,7 @@ export async function createGlobe(
       .selectAll<SVGPathElement, GeoPermissibleObjects>('path')
       .data([displayAtlas.landFeature])
       .join('path')
-      .attr('d', landPathData)
+      .each(function () { paintPath(this, landPathData) })
       .attr('fill', UNSOLVED_LAND_FILL)
       .attr('stroke', 'none')
 
@@ -1870,7 +1835,7 @@ export async function createGlobe(
         (entry) => entry.id,
       )
       .join('path')
-      .attr('d', (entry) => projectedPathData(entry.feature))
+      .each(function (entry) { paintPath(this, projectedPathData(entry.feature)) })
       .each(function (entry) {
         const paintedFill = paintedCountryFills.get(this)
         if (paintedFill === entry.appearanceFill) return
@@ -1887,7 +1852,7 @@ export async function createGlobe(
     renderFlights()
 
     coastlinePath
-      .attr('d', landPathData)
+      .each(function () { paintPath(this, landPathData) })
       .attr('fill', 'none')
       .attr('stroke', 'rgba(239, 247, 255, 0.76)')
       .attr('stroke-width', 1.3)
@@ -1895,7 +1860,7 @@ export async function createGlobe(
       .attr('stroke-linecap', 'round')
 
     borderPath
-      .attr('d', projectedPathData(displayAtlas.borderMesh))
+      .each(function () { paintPath(this, projectedPathData(displayAtlas.borderMesh)) })
       .attr('fill', 'none')
       .attr('stroke', 'rgba(227, 238, 247, 0.38)')
       .attr('stroke-width', 0.62)
@@ -1922,7 +1887,7 @@ export async function createGlobe(
       .selectAll<SVGPathElement, { answered: boolean; feature: AtlasFeature; id: string }>('path')
       .data(fallbackOutlineData, (entry) => entry.id)
       .join('path')
-      .attr('d', (entry) => projectedPathData(entry.feature))
+      .each(function (entry) { paintPath(this, projectedPathData(entry.feature)) })
       .attr('fill', 'none')
       .attr('stroke', (entry) =>
         entry.answered
@@ -1962,7 +1927,7 @@ export async function createGlobe(
         .join('path')
         .attr('class', 'globe__hit-target')
         .attr('data-country-id', (entry) => entry.id)
-        .attr('d', (entry) => projectedPathData(entry.feature))
+        .each(function (entry) { paintPath(this, projectedPathData(entry.feature)) })
         .attr('fill', 'rgba(0, 0, 0, 0.001)')
         .attr('stroke', 'none')
         .on('click', function (event: MouseEvent, entry) {
@@ -2015,7 +1980,6 @@ export async function createGlobe(
     }
 
     settleActiveFlight()
-    endOutlineMotion('flight', 0)
 
     if (shouldCancelPerformance) {
       settleFlightPerformance('cancelled')
@@ -2148,7 +2112,6 @@ export async function createGlobe(
       activeFlightSegmentId = segment.id
       activeFlightProgress = 0
       planeCoordinates = segment.fromCoordinates
-      beginOutlineMotion('flight')
       startFlightPerformance(segment, startTime)
 
       const tick = (now: number) => {
@@ -2171,7 +2134,6 @@ export async function createGlobe(
         activeFlightProgress = 1
         activeFlightSegmentId = null
         flyFrame = null
-        endOutlineMotion('flight')
         settleFlightPerformance('complete')
         renderNow()
       }
@@ -2195,7 +2157,6 @@ export async function createGlobe(
     activeFlightSegmentId = segment.id
     activeFlightProgress = 0
     planeCoordinates = segment.fromCoordinates
-    beginOutlineMotion('flight')
     startFlightPerformance(segment, startTime)
 
     const tick = (now: number) => {
@@ -2222,7 +2183,6 @@ export async function createGlobe(
       activeFlightProgress = 1
       activeFlightSegmentId = null
       flyFrame = null
-      endOutlineMotion('flight')
       settleFlightPerformance('complete')
       renderNow()
     }
@@ -2252,7 +2212,6 @@ export async function createGlobe(
       return !event.ctrlKey && event.button === 0
     })
     .on('start', () => {
-      beginOutlineMotion('drag')
       cancelFlyAnimation()
     })
     .on('drag', (event: D3DragEvent<SVGSVGElement, unknown, unknown>) => {
@@ -2272,9 +2231,6 @@ export async function createGlobe(
         rotationGamma,
       ])
       scheduleRender()
-    })
-    .on('end', () => {
-      endOutlineMotion('drag')
     })
 
   mapSvg.call(dragBehavior)
@@ -2303,7 +2259,6 @@ export async function createGlobe(
     'wheel',
     (event: WheelEvent) => {
       event.preventDefault()
-      pulseWheelOutlineMotion()
       cancelFlyAnimation()
       applyZoom(currentZoom * wheelZoomFactor(event))
     },
@@ -2337,7 +2292,6 @@ export async function createGlobe(
       }
 
       event.preventDefault()
-      beginOutlineMotion('pinch')
       cancelFlyAnimation()
       pinchZoomState = {
         distance,
@@ -2378,14 +2332,12 @@ export async function createGlobe(
 
       event.preventDefault()
       event.stopImmediatePropagation()
-      beginOutlineMotion('pinch')
       applyZoom(pinchZoomState.zoom * (distance / pinchZoomState.distance))
     },
     { capture: true, passive: false },
   )
 
   const clearPinchZoomState = (): void => {
-    endOutlineMotion('pinch')
     pinchZoomState = null
   }
 

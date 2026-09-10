@@ -777,6 +777,11 @@ h1 {
   cursor: grabbing;
 }
 
+.globe-frame:not([data-projection="orthographic"]) :is(.globe__countries, .globe__solved, .globe__fallback-outlines, .globe__hit-targets) path,
+.globe-frame:not([data-projection="orthographic"]) :is(.globe__coastlines, .globe__borders) {
+  vector-effect: non-scaling-stroke;
+}
+
 .globe__labels-svg,
 .globe__labels,
 .globe__label,

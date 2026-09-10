@@ -7,6 +7,7 @@ import { serveBuild } from './lib/serve-build.mjs'
 // node scripts/benchmark-flights.mjs <build-dir> <result-name> [cpu-rate] [repeats] [mobile]
 const [directory = 'dist', name = 'current', rate = '6', repeats = '3', device] = process.argv.slice(2)
 const solvedCount = Number(process.env.SOLVED_COUNT ?? 0)
+const query = process.env.QUERY ?? ''
 if (!Number.isInteger(solvedCount) || solvedCount < 0 || solvedCount > 196) throw new Error('SOLVED_COUNT must be 0–196')
 const output = resolve('output/playwright')
 await mkdir(output, { recursive: true })
@@ -21,7 +22,7 @@ try {
   const page = await context.newPage()
   const errors = []
   page.on('pageerror', (e) => errors.push(e.message))
-  await page.goto(server.url)
+  await page.goto(server.url + query)
   await page.waitForFunction(() => window.__countriesQuizDebug && document.querySelector('.globe__hit-target'))
   await page.waitForTimeout(700)
   if (solvedCount) {
@@ -55,7 +56,14 @@ try {
   }
   const frames = results.reduce((n, r) => n + r.frameCount, 0)
   const sampledMs = results.reduce((n, r) => n + r.frameCount * r.averageFrameMs, 0)
-  const summary = { name, browser: browser.version(), cpuRate: Number(rate), device: device ?? 'desktop', solvedCount, fps: frames / sampledMs * 1000, errors, results }
+  const routeSummaries = routes.slice(1).map((to, index) => {
+    const from = routes[index]
+    const flights = results.filter(result => result.fromCountryId === from && result.toCountryId === to)
+    const frames = flights.reduce((n, result) => n + result.frameCount, 0)
+    const sampledMs = flights.reduce((n, result) => n + result.frameCount * result.averageFrameMs, 0)
+    return { from, to, fps: frames / sampledMs * 1000 }
+  })
+  const summary = { name, browser: browser.version(), cpuRate: Number(rate), device: device ?? 'desktop', solvedCount, query, fps: frames / sampledMs * 1000, routeSummaries, errors, results }
   await writeFile(`${output}/${name}.json`, JSON.stringify(summary, null, 2))
   console.log(JSON.stringify({ ...summary, results: undefined }))
   if (process.env.PROFILE) {
