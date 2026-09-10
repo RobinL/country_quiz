@@ -734,6 +734,10 @@ export async function createGlobe(
   let currentProjectionKey = options?.initialProjection ?? DEFAULT_GLOBE_PROJECTION
   let projection = createProjection(currentProjectionKey)
   let measurementPath = geoPath(projection)
+  // Projection-dependent positions live for one render only. Labels and the
+  // plane use the same polygon centroid, including its horizon clipping.
+  const projectedLabelPositions = new Map<string, [number, number] | null>()
+  const paintedLabels = new WeakMap<SVGGElement, GlobeLabel>()
   const graticule = geoGraticule10()
   const desktopFlightTrailsMediaQuery = window.matchMedia(DESKTOP_FLIGHT_TRAILS_MEDIA_QUERY)
 
@@ -1405,6 +1409,16 @@ export async function createGlobe(
   }
 
   function projectedLabelPosition(countryId: string): [number, number] | null {
+    if (projectedLabelPositions.has(countryId)) {
+      return projectedLabelPositions.get(countryId)!
+    }
+
+    const position = computeProjectedLabelPosition(countryId)
+    projectedLabelPositions.set(countryId, position)
+    return position
+  }
+
+  function computeProjectedLabelPosition(countryId: string): [number, number] | null {
     const centroid = centroidForCountry(countryId)
     const labelFeature = labelFeatureForCountry(countryId)
 
@@ -1499,16 +1513,9 @@ export async function createGlobe(
     const visibleLabels: GlobeLabel[] = labelIds
       .map((countryId) => {
         const country = countryById.get(countryId)
-        const centroid = centroidForCountry(countryId)
-        const labelFeature = labelFeatureForCountry(countryId)
+        const projected = projectedLabelPosition(countryId)
 
-        if (!country || !centroid || !labelFeature || !isVisible(centroid)) {
-          return null
-        }
-
-        const projected = measurementPath.centroid(labelFeature)
-
-        if (!projected || Number.isNaN(projected[0]) || Number.isNaN(projected[1])) {
+        if (!country || !projected) {
           return null
         }
 
@@ -1579,6 +1586,20 @@ export async function createGlobe(
       )
       .attr('transform', (label: GlobeLabel) => `translate(${label.x} ${label.y})`)
       .each(function (label: GlobeLabel) {
+        // Moving a label does not change its text, flag, or styling. Rewriting
+        // textContent every frame rebuilds SVG text layout in the browser.
+        const painted = paintedLabels.get(this)
+        if (
+          painted &&
+          painted.name === label.name &&
+          painted.detail === label.detail &&
+          painted.flagAssetUrl === label.flagAssetUrl &&
+          painted.markerText === label.markerText &&
+          painted.tone === label.tone
+        ) {
+          return
+        }
+        paintedLabels.set(this, label)
         const groupSelection = select(this)
         groupSelection
           .select<SVGTextElement>('.globe__label-name')
@@ -1695,6 +1716,7 @@ export async function createGlobe(
 
   function renderNow(): void {
     applyProjectionLayout()
+    projectedLabelPositions.clear()
     writeRenderState()
     const mostRecentAnsweredId = latestAnsweredId(answeredIds)
     const isFlightAnimating = Boolean(activeFlightSegmentId && activeFlightProgress < 1)
@@ -1702,6 +1724,8 @@ export async function createGlobe(
       outlineDetailMode === 'settled' && detailAtlas
         ? detailAtlas
         : atlas
+    // The fill and coastline share exactly the same geometry and projection.
+    const landPathData = projectedPathData(displayAtlas.landFeature)
 
     spherePath
       .attr('d', projectedPathData(currentSurfaceGeometry()))
@@ -1719,7 +1743,7 @@ export async function createGlobe(
       .selectAll<SVGPathElement, GeoPermissibleObjects>('path')
       .data([displayAtlas.landFeature])
       .join('path')
-      .attr('d', (featureEntry) => projectedPathData(featureEntry))
+      .attr('d', landPathData)
       .attr('fill', UNSOLVED_LAND_FILL)
       .attr('stroke', 'none')
 
@@ -1821,7 +1845,7 @@ export async function createGlobe(
     renderFlights()
 
     coastlinePath
-      .attr('d', projectedPathData(displayAtlas.landFeature))
+      .attr('d', landPathData)
       .attr('fill', 'none')
       .attr('stroke', 'rgba(239, 247, 255, 0.76)')
       .attr('stroke-width', 1.3)
